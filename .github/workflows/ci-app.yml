@@ -73,7 +73,7 @@ jobs:
         with:
           version: 3.x
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: task integration-test
+      - run: task int
 
   # ── 4. Build & push to tooling ECR ────────────────────────────────────────
   #    PR:   build only (validates Dockerfile, warms cache)
