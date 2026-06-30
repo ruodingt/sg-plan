@@ -54,6 +54,7 @@ def ping():
     return Response(status_code=200)
 
 
+# for aws endpoint
 @app.post("/invocations", response_model=FraudResponse)
 def invocations(payload: TransactionRequest) -> FraudResponse:
     return predict(payload)
