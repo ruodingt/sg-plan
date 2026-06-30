@@ -41,12 +41,8 @@ flowchart LR
         SLK(["Slack\nChannel"])
     end
 
-    GLUE["Glue Job\nBootstrap\none-time"]
-
     PS -->|raw events| KT
     PG -->|DMS| KD
-    PG --->|historical user_activity| GLUE
-    GLUE --->|seed 30d activity window state| FL
     KT -->|transaction events| FL
     KD -->|broadcast demographics| FL
     FL -->|raw enriched values| SM
@@ -74,15 +70,7 @@ Aurora demographic changes are captured by DMS and published to a dedicated Kine
 
 ### user_activity — Flink internal state
 
-`user_activity` history lives in Aurora/data lake. The rolling 30-day aggregate cannot be computed purely from the Kinesis stream because the stream only carries events from pipeline start.
-
-**Bootstrap (one-time at pipeline launch):**
-A Glue job reads the last 30 days of `user_activity` from Aurora and replays events into Flink as an ordered stream. Flink ingests these into its RocksDB-backed sliding window state before the live transaction stream is opened.
-
-The Kinesis `transactions` stream intentionally starts up ≥ 30 days before the Flink job. Once the stream has 30 days of retention (requires extended retention enabled), cold-start state can be rebuilt by replaying directly from `TRIM_HORIZON` — no Glue job needed. This is the preferred recovery path if a Flink checkpoint is ever lost (see runbook). For the initial deployment, Glue is required because Kinesis does not yet have 30 days of history.
-
-**Overlap and deduplication:**
-Glue reads Aurora up to `T₀` (Glue job start time); the Kinesis live consumer starts from `T₀ − 1h` to avoid gaps caused by clock skew or late-arriving events. The 1-hour overlap window means some events are processed twice. `ActivityAggregator` deduplicates by `event_id` using Flink `ValueState` with a 2-hour TTL — covering the overlap window without unbounded state growth.
+The Kinesis `transactions` stream starts up ≥ 30 days before the Flink job is launched (with extended retention enabled). When Flink starts, it replays from `TRIM_HORIZON` to seed the 30-day rolling window state — no separate bootstrap job required. The same replay path is used to recover from a lost Flink checkpoint.
 
 **Real-time (ongoing):**
 Every new transaction event is processed by Flink's keyed sliding window (keyed by `customer_id`). Flink maintains count / sum / avg aggregates over 24h, 7d, 30d windows entirely in internal state — no external store required.
@@ -117,7 +105,7 @@ The FastAPI container:
 Flink enqueues all events where `fraud_flag=True` to SQS. Lambda reads up to 10 messages per batch, retrieves the Slack webhook URL from Secrets Manager (cached in Lambda memory), and posts to Slack only for events where `fraud_probability ≥ ALERT_THRESHOLD` (Lambda env var, default 0.7).
 
 ### Step 5 — Inference log archival
-DataCaptureConfig writes raw input values and fraud scores to S3, partitioned by date. Queryable via Athena for drift analysis; used as the reference dataset for Model Monitor baselines.
+DataCaptureConfig writes raw input values and fraud scores to S3, partitioned by date and hour (`YYYY/MM/DD/HH`). Queryable via Athena for drift analysis; compared against the training-data baseline by Model Monitor to detect drift.
 
 ---
 
@@ -137,16 +125,9 @@ Key points:
 
 ## 5. Key Design Decisions
 
-### 5.1 Stream processing — KDA Flink vs Lambda
+### 5.1 Stream processing — KDA Flink vs PySpark Structured Streaming
 
-| | KDA Flink | Lambda |
-|---|---|---|
-| Stateful windowing | Native (RocksDB-backed) | Requires external state store |
-| Throughput | Millions of events/s | Expensive at 30k/s |
-| Keyed processing | Guarantees per-key ordering | No ordering guarantee |
-| Ops overhead | Managed by AWS | Fully serverless |
-
-**Decision: KDA Flink.** Rolling 30-day aggregates are inherently stateful. Lambda would require every invocation to read/write an external store, adding latency and cost. Flink's keyed streams guarantee that all events for a given `customer_id` are processed sequentially by the same task.
+**Decision: KDA Flink.** Rolling 30-day aggregates are inherently stateful; Flink's keyed streams guarantee that all events for a given `customer_id` are processed sequentially by the same task.
 
 **Rejected: PySpark Structured Streaming (Glue Streaming / EMR).**
 
@@ -162,7 +143,7 @@ Fraud detection requires a score before the customer session ends — second-lev
 
 ---
 
-### 5.2 Rolling aggregates — Flink internal state vs Redis
+### 5.2 Rolling aggregates — Flink internal state vs external state store (Redis)
 
 **Rejected: Redis sorted sets.**
 Storing raw events in Redis sorted sets (for exact rolling window queries) requires:
@@ -189,7 +170,7 @@ Fraud detection in this pipeline is **asynchronous** — the payment is processe
 | Cost at 30k RPS (est.) | ~$700–1,100/mo | ~$400–600/mo |
 | Scale-out speed | ~1–3 min | ~30–60s |
 
-**Decision: SageMaker.** Because detection is asynchronous, the latency difference (~10ms) is irrelevant. The built-in DataCaptureConfig eliminates a custom inference logging pipeline, and Model Monitor integrates directly with captured data for drift alerting. Model artifact (`fraud_model.pkl`) is stored independently in S3 — data scientists can retrain and update the model without triggering a CI/CD image build.
+**Decision: SageMaker.** Because detection is asynchronous, the latency difference (~10ms) is not a deciding factor. The built-in DataCaptureConfig eliminates a custom inference logging pipeline, and Model Monitor integrates directly with captured data for drift alerting. Model artifact (`fraud_model.pkl`) is stored independently in S3 — data scientists can retrain and update the model without triggering a CI/CD image build.
 
 ---
 
@@ -247,17 +228,11 @@ The main trade-off is that `DataCaptureConfig` captures raw strings rather than 
 
 ## 7. Trade-offs and Limitations
 
-**Flink state bootstrap complexity.** At pipeline launch, the Glue job must replay 30 days of `user_activity` into Flink state before the live stream opens. This adds operational complexity to the deployment runbook. Flink savepoints mitigate this for restarts (state is checkpointed to S3 and restored automatically).
-
-**One-event lag on rolling aggregates.** Each event is scored using aggregates from all *previous* events, not including itself. This is correct behaviour — we predict whether the current transaction is fraudulent based on prior history — and is consistent with how the model was trained.
+**Flink cold-start requires 30-day Kinesis history.** The Flink job must be launched after the Kinesis stream has accumulated 30 days of events (extended retention enabled). This is a pre-launch operational dependency — the stream must be started well in advance. Once running, Flink savepoints (checkpointed to S3) handle restarts without replaying from Kinesis.
 
 **SageMaker cold starts.** New instances take ~1–2 minutes to come online. At 30k RPS, sudden traffic spikes could exhaust the current instance pool before scale-out completes. Mitigate with a higher `min_capacity` baseline in production and a short scale-out cooldown (60s).
 
 **Location encoding.** The model was trained with a `LabelEncoder` mapping location strings to integers. This artifact must be stored alongside `fraud_model.pkl` in S3 and loaded by the FastAPI container at startup (TODO — not yet implemented). Non-numeric location strings cannot be encoded until the lookup table is available.
-
-**Rolling aggregates not yet in inference schema.** The Flink job computes per-customer 24h / 7d / 30d transaction counts and sums and passes them downstream. The current `inference.json` (v1) reflects the simplified feature set provided in the assessment and does not yet include these aggregate fields. The Flink job already computes 30-day rolling aggregates and passes them downstream. A future model version that incorporates velocity features (e.g. `tx_count_24h`, `tx_sum_7d`) only requires updating the inference schema and retraining the model artifact — no changes to the Flink job.
-
-**Model / code release coupling.** Model updates (new `fraud_model.pkl` in S3) require updating the SageMaker endpoint configuration and triggering a blue/green deployment. Code updates (new container image) require a CI/CD build. The two lifecycles are independent but both require a deployment step.
 
 ---
 
