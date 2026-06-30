@@ -148,8 +148,9 @@ resource "aws_sagemaker_model" "this" {
     model_data_url = var.model_s3_uri
 
     environment = {
-      MODEL_PATH    = "/opt/ml/model/fraud_model.pkl"
-      MODEL_VERSION = var.model_version
+      MODEL_PATH       = "/opt/ml/model/fraud_model.pkl"
+      MODEL_VERSION    = var.model_version
+      FRAUD_THRESHOLD  = var.fraud_threshold
     }
   }
 

@@ -27,6 +27,7 @@ def client():
         instance.predict.return_value = FraudResponse(
             fraud_flag=False,
             fraud_probability=0.12,
+            model_version="test",
         )
         with TestClient(app) as c:
             yield c, instance
@@ -84,6 +85,7 @@ def test_predict_high_fraud_score(client):
     mock_instance.predict.return_value = FraudResponse(
         fraud_flag=True,
         fraud_probability=0.95,
+        model_version="test",
     )
     resp = c.post("/predict", json=VALID_PAYLOAD)
     assert resp.status_code == 200

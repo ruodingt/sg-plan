@@ -20,8 +20,15 @@ _model: FraudModel | None = None
 async def lifespan(app: FastAPI):
     global _model
     model_path = os.getenv("MODEL_PATH", "fraud_model.pkl")
-    logger.info("Loading model from %s", model_path)
-    _model = FraudModel(model_path)
+    model_version = os.getenv("MODEL_VERSION", "unknown")
+    fraud_threshold = float(os.getenv("FRAUD_THRESHOLD", "0.5"))
+    logger.info(
+        "Loading model from %s (version=%s, threshold=%.2f)",
+        model_path,
+        model_version,
+        fraud_threshold,
+    )
+    _model = FraudModel(model_path, model_version, fraud_threshold)
     logger.info("Model loaded successfully")
     yield
     _model = None

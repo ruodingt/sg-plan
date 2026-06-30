@@ -441,8 +441,8 @@ Business fraud alerts, ML drift alerts, and infrastructure alerts go to separate
 Real-time fraud score ──→ Lambda ────────────────────────────────────────────────────→ #fraud-alerts    (business / ops)
 
                           Deequ (Data Quality)                    ┐
-                          Clarify Bias P(Ŷ|group)                │ publishes directly → CloudWatch Alarm ┐
-                          Model Quality P(Y|X)                   ┘                                       ├→ SNS → Chatbot → #ml-monitoring  (ML team)
+                          Clarify Bias P(Ŷ|group)                 │ publishes directly → CloudWatch Alarm ┐
+                          Model Quality P(Y|X)                    ┘                                       ├→ SNS → Chatbot → #ml-monitoring  (ML team)
 Data & model drift    ──→                                                                                 │
                           SHAP drift Lambda (reads Clarify S3 → put_metric_data) → CloudWatch ───────────┤
                           PSI Lambda (Athena → put_metric_data)                  → CloudWatch ───────────┤
@@ -464,8 +464,7 @@ The table below maps observable distributions to tools and ground-truth requirem
 | Distribution                   | What it detects                                                                                                                                                 | Tool                                       | Terraform resource                                                                        | Alert condition                                                                                                   | Ground truth |
 |--------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------|-------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|--------------|
 | P(X_i) — marginal statistics   | Per-feature completeness, data type, value range, categorical value set                                                                                         | Data Quality Monitor (Deequ)               | `aws_sagemaker_data_quality_job_definition` + `aws_sagemaker_monitoring_schedule`         | `violations > 0` — thresholds auto-derived from baseline `constraints.json`                                       | Not required |
-| P(X_i) — marginal histogram    | Per-feature distribution shift (PSI — Population Stability Index / KS — Kolmogorov-Smirnov test)                                                                | Custom Lambda + Athena over DataCapture S3 | `aws_lambda_function` + `aws_cloudwatch_event_rule`                                       | PSI > 0.2 for any monitored feature (industry standard; 0.1–0.2 = investigate)                                    | Not required |
-| P(X_i, X_j) — joint            | Correlation collapse between features                                                                                                                           | No native tool — see note                  | —                                                                                         | —                                                                                                                 | Not required |
+| P(X_i) — marginal histogram    | Per-feature distribution shift (PSI — Population Stability Index / KS — Kolmogorov–Smirnov test)                                                                | Custom Lambda + Athena over DataCapture S3 | `aws_lambda_function` + `aws_cloudwatch_event_rule`                                       | PSI > 0.2 for any monitored feature (industry standard; 0.1–0.2 = investigate)                                    | Not required |
 | E[\|φ_i\|] — mean SHAP attribution | Shift in mean absolute SHAP contribution per feature; indirectly captures joint distribution changes that per-feature PSI misses | Clarify feature attribution drift | `aws_sagemaker_model_explainability_job_definition` + `aws_sagemaker_monitoring_schedule` + `aws_lambda_function` + `aws_cloudwatch_metric_alarm` | Lambda reads Clarify S3 output → `put_metric_data`; alarm fires when E[\|φ_i\|] outside baseline allowed range | Not required |
 | P(Ŷ) — prediction distribution | Fraud score distribution shift; `fraud_flag` rate change                                                                                                        | CloudWatch custom metric                   | `aws_cloudwatch_metric_alarm`                                                             | `fraud_flag` rate outside business-defined range (e.g. [0.5 %, 5 %]); sustained shift in `fraud_probability` mean | Not required |
 | P(Ŷ \| group) — pre-training   | Demographic group representation in live data (class imbalance metric)                                                                                          | Clarify bias monitor (pre-training)        | `aws_sagemaker_model_bias_job_definition` + `aws_sagemaker_monitoring_schedule`           | Clarify bootstrap CI for CI metric disjoint from baseline allowed range                                           | Not required |
@@ -478,59 +477,29 @@ Data Quality Monitor (Deequ) and PSI both operate on individual feature marginal
 
 Further reading: [DBShap (arXiv 2401.09756)](https://arxiv.org/abs/2401.09756) — a 2024 research paper proposing a method to decompose drift into *virtual drift* (P(X) changes) and *real drift* (P(Y|X) changes) using Shapley values. Not yet production tooling; no AWS or library support. Useful for understanding the theoretical distinction between covariate shift and concept drift.
 
-**On joint distribution P(X_i, X_j):**
-No AWS-native tool monitors this directly. A correlation-collapse scenario (e.g., `income_bracket` and `transaction_value` become decorrelated) means each feature's marginal distribution is unchanged, but the model is predicting on a feature combination never seen in training. Detectable via SHAP drift but not via Deequ or per-feature PSI.
-
 ---
 
 ### 9.2.1 Drift response strategy
 
-Detection alone is not enough — each drift type requires a different response.
-
-**P(X) shift (covariate / virtual drift):**
-
-AUC (Model Quality Monitor) requires ground truth labels that arrive weeks later via chargebacks. At the moment P(X) shift is detected, labels are not yet available. Use P(Ŷ) as the immediate proxy:
+Without ground truth, drift type cannot be distinguished from proxy signals alone. When two or more signals (P(Ŷ) shift, SHAP rank order change, PSI) fire together and persist beyond 1-3 weeks, retrain.
 
 ```
-P(X) shift detected
-    ↓
-Is P(Ŷ) stable? (fraud_flag rate + fraud_probability mean — no ground truth needed)
-    │
-    ├─ Stable → model is producing consistent predictions despite input shift
-    │            monitor; wait for chargeback labels before acting
-    │
-    └─ Shifted → cannot distinguish genuine P(Y) change from model failure
-                  act conservatively: lower ALERT_THRESHOLD (e.g. 0.7 → 0.6)
-                  to increase recall while awaiting labels
-    ↓
-Chargebacks arrive (2–6 weeks later) → AUC / precision now computable
-    │
-    ├─ AUC intact → no retraining needed; restore threshold
-    │
-    └─ AUC degraded → retrain with importance weighting
-                       up-weight training samples matching new X distribution;
-                       no new labels needed for importance weighting
-```
-
-**P(Y|X) shift (concept drift / real drift) — requires ground truth:**
-
-```
-Model Quality Monitor fires (AUC drops, metric_violations > 0)
-    ↓
-Confirm via chargeback analysis — is the model missing new fraud patterns?
-    ↓
-Accumulate recent labeled data (chargebacks from past 4–8 weeks)
-    ↓
 Retrain on recent data → upload new model.tar.gz to tooling S3
     ↓
 deploy.yml: component=inference, env=prod, model_version=vN+1
 ```
 
-Concept drift cannot be resolved by threshold tuning — the model's learned mapping P(Y|X) is stale and must be replaced.
+**When ground truth is unavailable:**
 
-**P(X_i, X_j) joint shift (correlation collapse) — treat as P(X) shift:**
+Chargebacks may not exist or arrive too late to be actionable. In this case AUC is not computable and the decision must rely on proxy signals alone:
 
-Per-feature PSI and Deequ will not fire. SHAP drift is the primary detection signal. Once confirmed, the response is the same as covariate shift: retrain with importance weighting using the current joint distribution.
+| Signal | Threshold | Interpretation |
+|--------|-----------|----------------|
+| P(Ŷ) sustained shift | fraud_flag rate outside baseline range for > 2 weeks | Model output distribution has changed — direction unclear without labels |
+| SHAP rank order change | Top-3 features by E[\|φᵢ\|] change, sustained > 2 weeks | Model's decision basis has shifted away from training behaviour |
+| PSI high + SHAP drift together | PSI > 0.2 on multiple features AND SHAP rank changes | Input distribution and model response both shifted — stronger retraining signal than either alone |
+
+No single proxy is conclusive. When two or more fire together, the conservative response is to retrain. If ground truth is structurally unavailable (no chargeback pipeline), consider a calendar-based retraining cadence (e.g. quarterly) as a baseline policy — explicit and auditable even if not data-driven.
 
 ---
 
@@ -572,6 +541,8 @@ Updating the baseline after a retrain = update the S3 path variables + `task app
 ---
 
 ### 9.4 Model drift monitoring
+
+> **Note:** This section assumes a chargeback / confirmed-label pipeline exists. In practice ground truth is often unavailable or arrives too late to be actionable — in that case fall back to the proxy-signal approach in §9.2.1.
 
 **Managed by Terraform:**
 - `aws_sagemaker_model_quality_job_definition` — BinaryClassification, compares `fraud_probability` predictions to ground truth

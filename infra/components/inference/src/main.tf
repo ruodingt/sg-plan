@@ -9,6 +9,7 @@ module "sagemaker_inference" {
   container_image    = var.container_image
   model_s3_uri       = var.model_s3_uri
   model_version      = var.model_version
+  fraud_threshold    = var.fraud_threshold
 
   instance_type          = var.environment == "prod" ? "ml.c6i.xlarge" : "ml.c6i.large"
   initial_instance_count = var.environment == "prod" ? 3 : 1

@@ -34,6 +34,12 @@ variable "model_version" {
   type        = string
 }
 
+variable "fraud_threshold" {
+  description = "Probability threshold above which fraud_flag=true. Lower to increase recall during drift periods."
+  type        = number
+  default     = 0.5
+}
+
 variable "instance_type" {
   description = "SageMaker instance type"
   type        = string

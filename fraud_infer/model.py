@@ -30,9 +30,16 @@ FEATURE_ORDER: list[str] = [
 
 
 class FraudModel:
-    def __init__(self, model_path: str | Path = "fraud_model.pkl") -> None:
+    def __init__(
+        self,
+        model_path: str | Path = "fraud_model.pkl",
+        model_version: str = "unknown",
+        fraud_threshold: float = 0.5,
+    ) -> None:
         with open(model_path, "rb") as fh:
             self._model = pickle.load(fh)
+        self._model_version = model_version
+        self._fraud_threshold = fraud_threshold
 
     def predict(self, request: TransactionRequest) -> FraudResponse:
         encoded = [
@@ -48,7 +55,11 @@ class FraudModel:
         ]
         features = np.array([encoded], dtype=np.float32)
         proba = self._get_positive_proba(features)
-        return FraudResponse(fraud_flag=proba >= 0.5, fraud_probability=proba)
+        return FraudResponse(
+            fraud_flag=proba >= self._fraud_threshold,
+            fraud_probability=proba,
+            model_version=self._model_version,
+        )
 
     def _get_positive_proba(self, features: np.ndarray) -> float:
         """Handle both sklearn (XGBClassifier) and native XGBoost Booster APIs."""

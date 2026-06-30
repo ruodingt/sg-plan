@@ -6,3 +6,4 @@ variable "private_subnet_ids" { type = list(string) }
 variable "container_image"    { type = string }
 variable "model_s3_uri"       { type = string }
 variable "model_version"      { type = string }
+variable "fraud_threshold"    { type = number; default = 0.5 }
