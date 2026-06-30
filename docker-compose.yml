@@ -1,0 +1,17 @@
+services:
+  inference:
+    build: .
+    # No platform specified — builds for host arch (arm64 on M1, amd64 in CI).
+    # CI uses --platform linux/amd64 separately in ci.yml.
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./mock_model_train/fraud_model_mock.pkl:/opt/ml/model/fraud_model.pkl:ro
+    environment:
+      MODEL_PATH: /opt/ml/model/fraud_model.pkl
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s

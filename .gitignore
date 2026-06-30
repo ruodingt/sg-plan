@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Test & coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Ruff
+.ruff_cache/
+
+# Model artifacts — never commit trained models
+*.pkl
+*.tar.gz
+*.joblib
+
+# Terraform
+infra/bootstrap/src/terraform.tfstate
+infra/bootstrap/src/terraform.tfstate.backup
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+tfplan
+**/.terraform.lock.hcl
+infra/components/*/src/lambda_src/handler.zip
+infra/modules/*/build/
+
+# Environment / secrets
+.env
+*.env
+.envrc
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Docs
+docs/.task/

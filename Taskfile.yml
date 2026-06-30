@@ -1,0 +1,81 @@
+version: '3'
+
+# Usage:
+#   task bootstrap ENV=dev
+#   task plan      COMPONENT=kinesis ENV=dev
+#   task apply     COMPONENT=kinesis ENV=dev
+#   task destroy   COMPONENT=kinesis ENV=dev   (prompts for confirmation)
+
+tasks:
+  setup:
+    desc: "Install dev dependencies and register the pre-commit hook."
+    cmds:
+      - pip install -r requirements-dev.txt
+      - pre-commit install
+
+  lint:
+    desc: "Run ruff linter and formatter check."
+    cmds:
+      - ruff check fraud_infer/ tests/
+      - ruff format --check fraud_infer/ tests/
+
+  lint:fix:
+    desc: "Auto-fix ruff lint and format issues."
+    cmds:
+      - ruff check --fix fraud_infer/ tests/
+      - ruff format fraud_infer/ tests/
+
+  test:
+    desc: "Run unit tests with coverage."
+    cmds:
+      - pytest tests/ --ignore=tests/integration -v --tb=short --cov=fraud_infer --cov-report=term-missing --cov-fail-under=80
+
+  mock-model:
+    desc: "Retrain the mock XGBoost model (only needed if mock_model_train/ changes)."
+    dir: mock_model_train
+    cmds:
+      - python train.py
+
+  int:
+    desc: "Integration tests against the containerised service (/ping + /invocations)."
+    cmds:
+      - docker compose up -d --build --wait
+      - defer: docker compose down
+      - pytest tests/integration/ -v
+
+  bootstrap:
+    desc: "One-time per-account setup (S3 state bucket + DynamoDB). Requires local admin credentials."
+    dir: infra/bootstrap/src
+    cmds:
+      - terraform init
+      - terraform apply -var-file=../envs/{{.ENV}}.tfvars
+    requires:
+      vars: [ENV]
+
+  plan:
+    desc: "Plan a component. Extra TF flags via -- e.g. task plan COMPONENT=x ENV=dev -- -var=foo=bar"
+    dir: infra/components/{{.COMPONENT}}/src
+    cmds:
+      - terraform init -backend-config=../envs/{{.ENV}}-backend.hcl -reconfigure
+      - terraform plan -var-file=../envs/{{.ENV}}.tfvars {{.CLI_ARGS}}
+    requires:
+      vars: [COMPONENT, ENV]
+
+  apply:
+    desc: "Apply a component. Extra TF flags via -- e.g. task apply COMPONENT=x ENV=dev -- -auto-approve"
+    dir: infra/components/{{.COMPONENT}}/src
+    cmds:
+      - terraform init -backend-config=../envs/{{.ENV}}-backend.hcl -reconfigure
+      - terraform apply -var-file=../envs/{{.ENV}}.tfvars {{.CLI_ARGS}}
+    requires:
+      vars: [COMPONENT, ENV]
+
+  destroy:
+    desc: "Destroy a component (irreversible)."
+    prompt: "Destroy {{.COMPONENT}} in {{.ENV}}. Continue?"
+    dir: infra/components/{{.COMPONENT}}/src
+    cmds:
+      - terraform init -backend-config=../envs/{{.ENV}}-backend.hcl -reconfigure
+      - terraform destroy -var-file=../envs/{{.ENV}}.tfvars {{.CLI_ARGS}}
+    requires:
+      vars: [COMPONENT, ENV]
