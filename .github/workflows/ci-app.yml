@@ -9,12 +9,15 @@ on:
       - 'Dockerfile'
       - 'requirements*.txt'
       - 'tests/**'
+      - '.github/workflows/ci-app.yml'
   push:
     branches: [main]
     paths:
       - 'fraud_infer/**'
       - 'Dockerfile'
       - 'requirements*.txt'
+      - 'tests/**'
+      - '.github/workflows/ci-app.yml'
 
 env:
   PYTHON_VERSION: "3.11"
