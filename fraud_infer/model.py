@@ -7,6 +7,7 @@ import numpy as np
 
 from fraud_infer.features import (
     encode_channel,
+    encode_event_created_at,
     encode_gender,
     encode_income,
     encode_location,
@@ -41,9 +42,7 @@ class FraudModel:
             encode_subscription(request.subscription_type),
             float(request.tenure_months) if request.tenure_months is not None else np.nan,
             encode_income(request.income_bracket),
-            float(request.event_created_at_ts)
-            if request.event_created_at_ts is not None
-            else np.nan,
+            encode_event_created_at(request.event_created_at_ts),
             float(request.transaction_value) if request.transaction_value is not None else np.nan,
             encode_channel(request.channel_type),
         ]

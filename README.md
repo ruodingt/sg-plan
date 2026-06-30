@@ -253,7 +253,7 @@ The main trade-off is that `DataCaptureConfig` captures raw strings rather than 
 
 **SageMaker cold starts.** New instances take ~1–2 minutes to come online. At 30k RPS, sudden traffic spikes could exhaust the current instance pool before scale-out completes. Mitigate with a higher `min_capacity` baseline in production and a short scale-out cooldown (60s).
 
-**Location encoding.** The model was trained with a `LabelEncoder` mapping location strings to integers. This artifact must be stored alongside `fraud_model.pkl` in S3 and loaded by the FastAPI container at startup. A hash-based fallback (`abs(hash(raw)) % 100_000`) is used for unseen locations, which may reduce accuracy for those cases.
+**Location encoding.** The model was trained with a `LabelEncoder` mapping location strings to integers. This artifact must be stored alongside `fraud_model.pkl` in S3 and loaded by the FastAPI container at startup (TODO — not yet implemented). Non-numeric location strings cannot be encoded until the lookup table is available.
 
 **Rolling aggregates not yet in inference schema.** The Flink job computes per-customer 24h / 7d / 30d transaction counts and sums and passes them downstream. The current `inference.json` (v1) reflects the simplified feature set provided in the assessment and does not yet include these aggregate fields. The Flink job already computes 30-day rolling aggregates and passes them downstream. A future model version that incorporates velocity features (e.g. `tx_count_24h`, `tx_sum_7d`) only requires updating the inference schema and retraining the model artifact — no changes to the Flink job.
 

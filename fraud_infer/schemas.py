@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -16,7 +17,7 @@ class TransactionRequest(BaseModel):
     subscription_type: Literal["FREE", "STANDARD", "PREMIUM"] | None = None
     tenure_months: int | None = Field(default=None, ge=0)
     income_bracket: Literal["LOW", "MED", "HIGH"] | None = None
-    event_created_at_ts: float | None = None
+    event_created_at_ts: datetime | float | None = None
     transaction_value: float | None = Field(default=None, ge=0)
     channel_type: Literal["ONLINE", "IN-STORE"] | None = None
 

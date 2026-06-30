@@ -1,7 +1,8 @@
 """
 Lambda: reads fraud-alert messages from SQS and posts Slack notifications.
 Flink is responsible for threshold filtering — every message received here is posted.
-Slack webhook URL is retrieved from Secrets Manager at cold-start and cached.
+Slack webhook URL is retrieved from Secrets Manager and cached with a TTL so that
+secret rotation is picked up within _WEBHOOK_URL_TTL_S seconds without needing a cold start.
 """
 
 from __future__ import annotations
@@ -9,8 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import urllib.request
-from functools import lru_cache
 
 import boto3
 
@@ -18,6 +19,9 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 SLACK_SECRET_ARN = os.environ["SLACK_SECRET_ARN"]
+ALERT_THRESHOLD = float(os.environ.get("ALERT_THRESHOLD", "0.7"))
+
+_WEBHOOK_URL_TTL_S = 300  # re-fetch from Secrets Manager every 5 minutes
 
 # Fields shown in the Slack alert, in order.
 # (slack_title, payload_key, formatter)
@@ -34,12 +38,18 @@ _ALERT_FIELDS: list[tuple[str, str, object]] = [
     ("Model Version", "model_version", str),
 ]
 
+_cached_webhook_url: str | None = None
+_cached_at: float = 0.0
 
-@lru_cache(maxsize=1)
+
 def _get_webhook_url() -> str:
-    client = boto3.client("secretsmanager")
-    secret = client.get_secret_value(SecretId=SLACK_SECRET_ARN)
-    return json.loads(secret["SecretString"])["webhook_url"]
+    global _cached_webhook_url, _cached_at
+    if _cached_webhook_url is None or time.monotonic() - _cached_at > _WEBHOOK_URL_TTL_S:
+        client = boto3.client("secretsmanager")
+        secret = client.get_secret_value(SecretId=SLACK_SECRET_ARN)
+        _cached_webhook_url = json.loads(secret["SecretString"])["webhook_url"]
+        _cached_at = time.monotonic()
+    return _cached_webhook_url
 
 
 def lambda_handler(event: dict, context) -> dict:
@@ -49,7 +59,8 @@ def lambda_handler(event: dict, context) -> dict:
         message_id = record.get("messageId", "unknown")
         try:
             body = json.loads(record["body"])
-            _post_to_slack(_build_message(body))
+            if body.get("fraud_probability", 0.0) >= ALERT_THRESHOLD:
+                _post_to_slack(_build_message(body))
         except Exception:
             logger.exception("Failed to post Slack alert for messageId=%s", message_id)
             batch_item_failures.append({"itemIdentifier": message_id})

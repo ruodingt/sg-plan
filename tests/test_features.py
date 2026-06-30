@@ -1,7 +1,11 @@
+import math
+from datetime import UTC, datetime
+
 import pytest
 
 from fraud_infer.features import (
     encode_channel,
+    encode_event_created_at,
     encode_gender,
     encode_income,
     encode_location,
@@ -66,17 +70,27 @@ class TestEncodeChannel:
             encode_channel("MOBILE")
 
 
+class TestEncodeEventCreatedAt:
+    def test_float_passthrough(self):
+        assert encode_event_created_at(1_720_000_000.0) == 1_720_000_000.0
+
+    def test_aware_datetime(self):
+        dt = datetime(2024, 7, 3, 10, 0, 0, tzinfo=UTC)
+        assert encode_event_created_at(dt) == pytest.approx(dt.timestamp())
+
+    def test_naive_datetime_treated_as_utc(self):
+        naive = datetime(2024, 7, 3, 10, 0, 0)
+        aware = datetime(2024, 7, 3, 10, 0, 0, tzinfo=UTC)
+        assert encode_event_created_at(naive) == pytest.approx(aware.timestamp())
+
+    def test_none_returns_nan(self):
+        assert math.isnan(encode_event_created_at(None))
+
+
 class TestEncodeLocation:
     def test_numeric_string(self):
         assert encode_location("42") == 42
 
-    def test_string_is_deterministic(self):
-        assert encode_location("Sydney") == encode_location("Sydney")
-
-    def test_string_returns_non_negative(self):
-        result = encode_location("Melbourne")
-        assert isinstance(result, int)
-        assert result >= 0
-
-    def test_different_strings_differ(self):
-        assert encode_location("Sydney") != encode_location("Melbourne")
+    def test_non_numeric_string_returns_nan(self):
+        assert math.isnan(encode_location("Sydney"))
+        assert math.isnan(encode_location("Melbourne"))

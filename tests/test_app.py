@@ -74,7 +74,7 @@ def test_predict_negative_transaction_value(client):
 
 def test_predict_missing_required_field(client):
     c, _ = client
-    payload = {k: v for k, v in VALID_PAYLOAD.items() if k != "age"}
+    payload = {k: v for k, v in VALID_PAYLOAD.items() if k != "customer_id"}
     resp = c.post("/predict", json=payload)
     assert resp.status_code == 422
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 
 GENDER_MAP: dict[str, int] = {"male": 1, "female": 2}
 SUBSCRIPTION_MAP: dict[str, int] = {"FREE": 0, "STANDARD": 1, "PREMIUM": 2}
@@ -37,15 +38,27 @@ def encode_channel(raw: str | None) -> float:
     return CHANNEL_MAP[raw.strip().upper()]
 
 
+def encode_event_created_at(raw: datetime | float | None) -> float:
+    """Convert event_created_at (DATETIME from user_activity) to a Unix timestamp float.
+
+    Accepts a Python datetime (naive treated as UTC) or a numeric value already
+    in Unix seconds. Returns nan if missing.
+    """
+    if raw is None:
+        return _NAN
+    if isinstance(raw, datetime):
+        if raw.tzinfo is None:
+            raw = raw.replace(tzinfo=UTC)
+        return raw.timestamp()
+    return float(raw)
+
+
 def encode_location(raw: str | None) -> float:
-    """
-    In production, load a LabelEncoder fitted at training time from the model
-    artifact store (e.g. S3 alongside fraud_model.pkl). Here we use a
-    deterministic hash as a safe fallback so unknown locations don't crash.
-    """
+    # TODO: load the LabelEncoder fitted at training time (stored alongside fraud_model.pkl in S3)
+    #       and use it for the string → integer mapping. Until then, non-numeric values return nan.
     if raw is None:
         return _NAN
     try:
         return int(raw)
     except (ValueError, TypeError):
-        return abs(hash(raw)) % 100_000
+        return _NAN
