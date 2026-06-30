@@ -3,10 +3,12 @@ name: App CI
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened]
     paths:
       - 'fraud_infer/**'
       - 'Dockerfile'
       - 'requirements*.txt'
+      - 'tests/**'
   push:
     branches: [main]
     paths:
