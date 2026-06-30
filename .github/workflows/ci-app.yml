@@ -57,12 +57,30 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: task test
 
-  # ── 3. Build & push to tooling ECR ────────────────────────────────────────
+  # ── 3. Integration test ───────────────────────────────────────────────────
+  integration-test:
+    name: Integration test
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: task integration-test
+
+  # ── 4. Build & push to tooling ECR ────────────────────────────────────────
   #    PR:   build only (validates Dockerfile, warms cache)
   #    main: build + push
   build:
     name: Build & push (tooling ECR)
-    needs: [lint, test]
+    needs: [lint, test, integration-test]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
