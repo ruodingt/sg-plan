@@ -35,14 +35,16 @@ class FraudModel:
 
     def predict(self, request: TransactionRequest) -> FraudResponse:
         encoded = [
-            request.age,
+            float(request.age) if request.age is not None else np.nan,
             encode_gender(request.gender),
             encode_location(request.location),
             encode_subscription(request.subscription_type),
-            request.tenure_months,
+            float(request.tenure_months) if request.tenure_months is not None else np.nan,
             encode_income(request.income_bracket),
-            request.event_created_at_ts,
-            request.transaction_value,
+            float(request.event_created_at_ts)
+            if request.event_created_at_ts is not None
+            else np.nan,
+            float(request.transaction_value) if request.transaction_value is not None else np.nan,
             encode_channel(request.channel_type),
         ]
         features = np.array([encoded], dtype=np.float32)

@@ -10,15 +10,15 @@ class TransactionRequest(BaseModel):
     """
 
     customer_id: str  # passthrough: not a model feature, used for logging only
-    age: int = Field(ge=0, le=120)
-    gender: str
-    location: str
-    subscription_type: Literal["FREE", "STANDARD", "PREMIUM"]
-    tenure_months: int = Field(ge=0)
-    income_bracket: Literal["LOW", "MED", "HIGH"]
-    event_created_at_ts: float
-    transaction_value: float = Field(ge=0)
-    channel_type: Literal["ONLINE", "IN-STORE"]
+    age: int | None = Field(default=None, ge=0, le=120)
+    gender: str | None = None
+    location: str | None = None
+    subscription_type: Literal["FREE", "STANDARD", "PREMIUM"] | None = None
+    tenure_months: int | None = Field(default=None, ge=0)
+    income_bracket: Literal["LOW", "MED", "HIGH"] | None = None
+    event_created_at_ts: float | None = None
+    transaction_value: float | None = Field(default=None, ge=0)
+    channel_type: Literal["ONLINE", "IN-STORE"] | None = None
 
 
 class FraudResponse(BaseModel):

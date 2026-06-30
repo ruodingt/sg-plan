@@ -22,12 +22,11 @@ on:
           - dev
           - sit
           - prod
-      image_sha:
-        description: "Git SHA of the image to deploy (inference only — must exist in dev ECR)"
-        required: false
+
+# All deployment variables (container_image, model_s3_uri, etc.) live in
+# infra/components/<component>/envs/<env>.tfvars — update and commit before deploying.
 
 env:
-  ECR_REPO: eg-fraud-inference
   AWS_REGION: ap-southeast-2
 
 jobs:
@@ -41,7 +40,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── Resolve deploy role for the target environment ─────────────────────
       - name: Resolve deploy role ARN
         id: role
         run: |
@@ -51,41 +49,7 @@ jobs:
             prod) echo "arn=${{ vars.PROD_DEPLOY_ROLE_ARN }}" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      # ── Promote image dev ECR → target ECR (inference, non-dev only) ───────
-      - name: Configure AWS credentials — dev (pull image)
-        if: inputs.component == 'inference' && inputs.env != 'dev' && inputs.image_sha != ''
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.DEV_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to dev ECR
-        if: inputs.component == 'inference' && inputs.env != 'dev' && inputs.image_sha != ''
-        id: login-dev
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Configure AWS credentials — target env (push image)
-        if: inputs.component == 'inference' && inputs.env != 'dev' && inputs.image_sha != ''
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ steps.role.outputs.arn }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to target ECR & promote image
-        if: inputs.component == 'inference' && inputs.env != 'dev' && inputs.image_sha != ''
-        id: promote
-        run: |
-          TARGET_REGISTRY=$(aws ecr describe-repositories \
-            --repository-names ${{ env.ECR_REPO }} \
-            --query 'repositories[0].repositoryUri' --output text | cut -d/ -f1)
-          IMAGE_URI="${TARGET_REGISTRY}/${{ env.ECR_REPO }}:${{ inputs.image_sha }}"
-          docker pull "${{ steps.login-dev.outputs.registry }}/${{ env.ECR_REPO }}:${{ inputs.image_sha }}"
-          docker tag  "${{ steps.login-dev.outputs.registry }}/${{ env.ECR_REPO }}:${{ inputs.image_sha }}" "$IMAGE_URI"
-          docker push "$IMAGE_URI"
-          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
-
-      # ── Terraform apply ────────────────────────────────────────────────────
-      - name: Configure AWS credentials — target env
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ steps.role.outputs.arn }}
@@ -101,17 +65,4 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Terraform apply
-        run: |
-          # For inference: set container_image from promoted URI, dev ECR URI, or skip if not provided
-          if [[ "${{ inputs.component }}" == "inference" ]]; then
-            if [[ -n "${{ steps.promote.outputs.uri }}" ]]; then
-              export TF_VAR_container_image="${{ steps.promote.outputs.uri }}"
-            elif [[ -n "${{ inputs.image_sha }}" ]]; then
-              # dev deploy: image already in dev ECR
-              DEV_REGISTRY=$(aws ecr describe-repositories \
-                --repository-names ${{ env.ECR_REPO }} \
-                --query 'repositories[0].repositoryUri' --output text | cut -d/ -f1)
-              export TF_VAR_container_image="${DEV_REGISTRY}/${{ env.ECR_REPO }}:${{ inputs.image_sha }}"
-            fi
-          fi
-          task apply COMPONENT=${{ inputs.component }} ENV=${{ inputs.env }} -- -auto-approve
+        run: task apply COMPONENT=${{ inputs.component }} ENV=${{ inputs.env }} -- -auto-approve

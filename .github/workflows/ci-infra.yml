@@ -1,0 +1,79 @@
+name: Infra CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/**'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+
+env:
+  AWS_REGION: ap-southeast-2
+
+jobs:
+
+  # ── 0. Detect changed components + build matrix ───────────────────────────
+  plan-matrix:
+    name: Build plan matrix
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.build.outputs.components }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            inference:
+              - 'infra/components/inference/**'
+              - 'infra/modules/sagemaker_inference/**'
+            kinesis:
+              - 'infra/components/kinesis/**'
+            fraud_alert:
+              - 'infra/components/fraud_alert/**'
+            fraud_feature_pipe:
+              - 'infra/components/fraud_feature_pipe/**'
+      - id: build
+        run: |
+          c=()
+          [[ "${{ steps.filter.outputs.inference }}"          == "true" ]] && c+=("inference")
+          [[ "${{ steps.filter.outputs.kinesis }}"            == "true" ]] && c+=("kinesis")
+          [[ "${{ steps.filter.outputs.fraud_alert }}"        == "true" ]] && c+=("fraud_alert")
+          [[ "${{ steps.filter.outputs.fraud_feature_pipe }}" == "true" ]] && c+=("fraud_feature_pipe")
+          echo "components=$(jq -nc '$ARGS.positional' --args "${c[@]}")" >> "$GITHUB_OUTPUT"
+
+  # ── 1. Terraform plan — one job per changed component ─────────────────────
+  plan-dev:
+    name: Plan → dev / ${{ matrix.component }}
+    needs: [plan-matrix]
+    if: needs.plan-matrix.outputs.components != '[]'
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.plan-matrix.outputs.components) }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials — dev (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEV_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.5"
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Plan ${{ matrix.component }}
+        run: task plan COMPONENT=${{ matrix.component }} ENV=dev
