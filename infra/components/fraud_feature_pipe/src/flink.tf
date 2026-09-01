@@ -94,7 +94,7 @@ resource "aws_iam_role_policy_attachment" "kda_vpc" {
 
 resource "aws_security_group" "kda" {
   name        = "${local.prefix}-kda-sg"
-  description = "KDA Flink — outbound HTTPS only"
+  description = "Managed Service for Apache Flink — outbound HTTPS only"
   vpc_id      = var.vpc_id
   egress {
     description = "HTTPS to AWS services"

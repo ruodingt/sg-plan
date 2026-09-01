@@ -26,12 +26,12 @@ flowchart LR
         KD["Kinesis\ndemographics\nDMS CDC"]
     end
 
-    subgraph FL_BOX["KDA · Apache Flink"]
+    subgraph FL_BOX["Amazon Managed Service for Apache Flink"]
         FL["Broadcast Join\n+ 30d Activity Window Agg"]
     end
 
     subgraph SM_BOX["SageMaker"]
-        SM["Endpoint · FastAPI\nencode → predict (XGBoost)\nml.c6i.xlarge × 2-20"]
+        SM["Endpoint · FastAPI\nencode → predict (XGBoost)\nbenchmark-sized capacity"]
         S3C[("S3\nDataCapture\ninputs + outputs")]
     end
 
@@ -62,7 +62,7 @@ Assumption：Both reference tables originate in **PostgreSQL**. They enter the r
 | Table | Freshness | Path into Flink |
 |---|---|---|
 | `user_demographic` | Minutes | DMS CDC → Kinesis → Flink broadcast state |
-| `user_activity` | Historical baseline + real-time | One-time Glue bootstrap + Flink sliding window state |
+| `user_activity` | Real-time, with progressive 30-day warm-up | Flink keyed state populated from new transaction events |
 
 ### user_demographic — broadcast stream
 
@@ -70,7 +70,19 @@ Aurora demographic changes are captured by DMS and published to a dedicated Kine
 
 ### user_activity — Flink internal state
 
-The Kinesis `transactions` stream starts up ≥ 30 days before the Flink job is launched (with extended retention enabled). When Flink starts, it replays from `TRIM_HORIZON` to seed the 30-day rolling window state — no separate bootstrap job required. The same replay path is used to recover from a lost Flink checkpoint.
+The initial 30-day state can be established in three ways:
+
+| Option | Benefit | Cost / risk |
+|---|---|---|
+| Historical batch bootstrap (for example Glue) | Full 30-day features are available at launch | Requires a separate historical pipeline, state hand-off design, validation, and additional delivery time |
+| Replay retained Kinesis events from `TRIM_HORIZON` | Reuses the streaming feature code | Reprocessing approximately 77 billion events can take substantial time and cost; recovery time is uncertain |
+| Progressive warm-up from new events | Simplest and fastest path to production; no bootstrap system | 30-day features remain incomplete until day 30 and require an explicit cold-start policy |
+
+**Decision: progressive warm-up.** Start the Kinesis stream and Flink job together and allow the activity state to mature over 30 days. The 24-hour feature becomes complete after 24 hours, the 7-day feature after 7 days, and the 30-day feature after 30 days. This avoids building a separate historical bootstrap pipeline or replaying approximately 77 billion events before launch.
+
+During warm-up, every prediction must carry an `activity_history_seconds` (or equivalent coverage field). The model must either have been trained to handle partial-history aggregates, use a separate cold-start model, or defer scoring until the minimum required coverage is available. Returning an incomplete 30-day aggregate as though it were complete would create training-serving skew.
+
+This is an explicit time-to-market trade-off: it is appropriate only if the business accepts reduced model quality during the warm-up period. After the state is mature, normal failures recover from Managed Service for Apache Flink checkpoints and application snapshots rather than rebuilding 30 days of history. A full historical bootstrap remains a future option if immediate full-window accuracy becomes a launch requirement.
 
 **Real-time (ongoing):**
 Every new transaction event is processed by Flink's keyed sliding window (keyed by `customer_id`). Flink maintains count / sum / avg aggregates over 24h, 7d, 30d windows entirely in internal state — no external store required.
@@ -125,21 +137,21 @@ Key points:
 
 ## 5. Key Design Decisions
 
-### 5.1 Stream processing — KDA Flink vs PySpark Structured Streaming
+### 5.1 Stream processing — Amazon Managed Service for Apache Flink vs PySpark Structured Streaming
 
-**Decision: KDA Flink.** Rolling 30-day aggregates are inherently stateful; Flink's keyed streams guarantee that all events for a given `customer_id` are processed sequentially by the same task.
+**Decision: Amazon Managed Service for Apache Flink.** Rolling 30-day aggregates are inherently stateful; Flink's keyed streams guarantee that all events for a given `customer_id` are processed sequentially by the same task.
 
 **Rejected: PySpark Structured Streaming (Glue Streaming / EMR).**
 
-| | Flink (KDA) | PySpark Structured Streaming |
+| | Amazon Managed Service for Apache Flink | PySpark Structured Streaming |
 |---|---|---|
 | Processing model | True event-by-event streaming | Micro-batch (1–10 s intervals) |
 | End-to-end latency | Milliseconds | Seconds |
 | Live broadcast join | `KeyedBroadcastProcessFunction` — CDC stream updates broadcast state in real time | Broadcast only supports static DataFrames; CDC requires periodic full reload (minutes of lag) |
 | Stateful windowing | Native RocksDB-backed state | Possible via `flatMapGroupsWithState` but operationally heavier |
-| AWS managed | KDA (purpose-built for Kinesis) | Glue Streaming / EMR |
+| AWS managed | Amazon Managed Service for Apache Flink | Glue Streaming / EMR |
 
-Fraud detection requires a score before the customer session ends — second-level latency is too high. The live demographic broadcast (DMS CDC) is also a blocker: PySpark cannot update a broadcast variable from a streaming source; demographic changes would lag by the reload interval. PySpark is used for the one-time Glue bootstrap job, where its batch processing strengths are appropriate.
+Fraud detection requires a score before the customer session ends — second-level latency is too high. The live demographic broadcast (DMS CDC) is also a blocker: PySpark cannot update a broadcast variable from a streaming source; demographic changes would lag by the reload interval. A batch engine such as Glue could be introduced later if the business requires a historical activity bootstrap, but it is not part of the selected progressive warm-up design.
 
 ---
 
@@ -153,6 +165,8 @@ Even distributed across users, the memory footprint is multiple terabytes — no
 **Decision: Flink internal state (RocksDB).**
 Flink maintains pre-aggregated window values in RocksDB, disk-backed and checkpointed to S3. Memory footprint is proportional to the number of unique users, not the number of events. No external store needed for aggregates.
 
+Here, **pre-aggregated window values** means compact time buckets containing statistics such as transaction count and sum, rather than every raw transaction. For example, a customer can have one bucket per hour containing `{count, sum}`; 24-hour, 7-day, and 30-day features are calculated by adding the buckets that fall inside each window and evicting expired buckets. The exact bucket size, event-time semantics, late-event policy, and whether the current transaction is included must match the training feature definition.
+
 **Demographics** are held in Flink broadcast state (one snapshot per `customer_id`). Small, infrequently updated, fits comfortably in memory.
 
 ---
@@ -161,16 +175,25 @@ Flink maintains pre-aggregated window values in RocksDB, disk-backed and checkpo
 
 Fraud detection in this pipeline is **asynchronous** — the payment is processed and committed before the fraud score is computed. Kinesis receives the transaction event in parallel; Flink enriches and scores it after the fact. A positive fraud signal triggers a Slack alert for human review and potential account action (freeze, reversal). This means inference latency does not affect the payment path.
 
-| | SageMaker Realtime | ECS Fargate |
+| Concern | SageMaker Realtime | ECS Fargate |
 |---|---|---|
-| Inference logging | DataCaptureConfig (built-in) | Custom (Kinesis → Firehose → S3) |
-| Drift monitoring | Model Monitor (native) | Custom pipeline |
-| Model / code decoupling | Native (model in S3) | Manual |
-| Latency | ~8–15ms | ~1–3ms |
-| Cost at 30k RPS (est.) | ~$700–1,100/mo | ~$400–600/mo |
-| Scale-out speed | ~1–3 min | ~30–60s |
+| Serving performance | Must be benchmarked with the real model, container, payload, and concurrency | Must be benchmarked with the real model, container, payload, and concurrency |
+| Inference logging | Data Capture is built in | Requires a custom logging pipeline, such as Firehose → S3 |
+| Drift monitoring | Integrates with Model Monitor | Requires a custom monitoring pipeline |
+| Model deployment | Managed endpoint and model-artifact integration | Custom model rollout, traffic shifting, and rollback workflow |
+| Runtime control | Less control over the serving stack | Greater control over workers, networking, and runtime tuning |
+| Cost at 30k events/s | Benchmark required; depends strongly on batching and instance count | Benchmark required; lower service overhead may be offset by custom operational components |
+| Operational effort | Lower | Higher |
 
-**Decision: SageMaker.** Because detection is asynchronous, the latency difference (~10ms) is not a deciding factor. The built-in DataCaptureConfig eliminates a custom inference logging pipeline, and Model Monitor integrates directly with captured data for drift alerting. Model artifact (`fraud_model.pkl`) is stored independently in S3 — data scientists can retrain and update the model without triggering a CI/CD image build.
+**Provisional decision: SageMaker with asynchronous event-by-event invocation.** SageMaker is preferred initially because Data Capture, Model Monitor, managed endpoint deployment, and model-version integration reduce the amount of custom MLOps infrastructure. This decision is conditional on a load test demonstrating that the endpoint can meet the throughput, p99 latency, error-rate, and cost requirements.
+
+The production Flink job uses Async I/O with bounded concurrency so that an endpoint call does not block the stream-processing task. Each transaction remains an independent inference request, preserving Flink's event-by-event processing semantics and the service's single-JSON API contract. Timeouts, retries, maximum in-flight requests, and ordered versus unordered completion must be configured explicitly so that downstream slowdown produces controlled backpressure rather than unbounded requests or silent event loss.
+
+Request batching is an optional optimisation evaluated during load testing, not part of the baseline design. Adopting it requires an explicit batch API contract, deterministic mapping of predictions back to events, partial-failure handling, and evidence that the additional buffering latency satisfies the alerting SLO.
+
+If benchmarking shows that single-event SageMaker invocation cannot meet the SLO or is uneconomic, the first fallback is an independently scalable inference service on ECS using the same asynchronous invocation pattern. Batching can then be considered for either platform. For the lowest latency and infrastructure cost, loading the model directly into each Flink task is also possible, but couples model rollout to the stream-processing deployment and requires a custom inference-capture pipeline.
+
+The final serving platform, instance type, concurrency, auto-scaling target, and instance count are determined using the measurement procedure in Section 6.1. Batch size is relevant only if the optional batch API is adopted. The model artifact (`fraud_model.pkl`) and its preprocessing artifacts remain independently versioned in S3 in every option.
 
 ---
 
@@ -221,22 +244,51 @@ The main trade-off is that `DataCaptureConfig` captures raw strings rather than 
 |---|---|
 | Kinesis shards | 30 × 1 MB/s = 30 MB/s; handles 30k events/s at ~1 KB/event |
 | Flink parallelism | 30 (matches shard count, no repartitioning) |
-| SageMaker instances | `ml.c6i.xlarge`; XGBoost on 9 features ~0.2ms compute; target 3,000 invocations/min/instance |
-| SageMaker scaling | 2 instances baseline, scale to 20 on invocation rate |
+| SageMaker instance type | `ml.c6i.xlarge` is the initial benchmark candidate; the final type is selected using SageMaker Inference Recommender against the real model artifact and representative payloads |
+| SageMaker throughput | Not assumed in advance. Measure the maximum sustainable requests/second per instance while meeting the p99 latency and error-rate SLOs |
+| SageMaker scaling | Set `SageMakerVariantInvocationsPerInstance` to 60–70% of the measured per-instance saturation throughput; derive `min_capacity` and `max_capacity` from the 30k records/s workload plus failure and burst headroom |
+
+### 6.1 SageMaker capacity measurement
+
+The model's `predict_proba()` execution time is not sufficient to size the endpoint. End-to-end capacity also includes feature encoding, JSON parsing and serialisation, the FastAPI/model-server stack, SageMaker routing, network transfer, concurrency, and Data Capture. Capacity must therefore be measured using the production container and model package.
+
+1. **Create representative test data.** Sample production-shaped requests, including realistic categorical values, missing values, payload sizes, and the expected distribution of transactions. Do not benchmark a single constant payload only.
+2. **Measure model-only latency.** After a warm-up period, benchmark `predict_proba()` for thousands of single-record calls and record p50, p95, and p99 latency. This identifies model compute cost but is not used directly as endpoint capacity.
+3. **Load-test the container locally.** Send concurrent requests to the same Docker image and `/invocations` route used by SageMaker. Increase concurrency in steps and record achieved RPS, p50/p95/p99 latency, CPU, memory, and errors.
+4. **Load-test one SageMaker instance.** Use SageMaker Inference Recommender (or an equivalent controlled load generator) with one `ml.c6i.xlarge`, the real `model.tar.gz`, Data Capture enabled, and representative requests. Increase load until throughput flattens, errors appear, or the p99 latency SLO is breached.
+5. **Select sustainable capacity.** Take the highest request rate that remains stable for a sustained test window while satisfying the latency and error-rate SLOs. Repeat the test after model, preprocessing, container, or instance-type changes.
+
+The auto-scaling target is expressed as invocations per minute per instance:
+
+```text
+target_invocations_per_instance = measured_sustainable_rps × 60 × target_utilisation
+```
+
+For example, if a single instance sustains 500 RPS and the target utilisation is 60%, the auto-scaling target is `500 × 60 × 0.60 = 18,000` invocations/minute/instance. This is an example calculation, not a measured result for this model.
+
+Required instance capacity is then calculated as:
+
+```text
+required_instances = ceil(peak_endpoint_rps / (measured_sustainable_rps × target_utilisation))
+```
+
+`peak_endpoint_rps` must reflect the actual inference call pattern. It is close to 30k RPS for one request per transaction, but lower if Flink uses supported request batching. Production `min_capacity` should tolerate the loss of at least one instance or Availability Zone, and `max_capacity` should include agreed burst headroom. Because SageMaker scale-out takes time, the steady-state minimum must carry traffic during the scale-out interval without violating the latency SLO.
 
 ---
 
 ## 7. Trade-offs and Limitations
 
-**Flink cold-start requires 30-day Kinesis history.** The Flink job must be launched after the Kinesis stream has accumulated 30 days of events (extended retention enabled). This is a pre-launch operational dependency — the stream must be started well in advance. Once running, Flink savepoints (checkpointed to S3) handle restarts without replaying from Kinesis.
+**Activity features require a 30-day warm-up.** Kinesis and Flink start together, and the rolling features progressively mature over 30 days. Predictions during this period must expose history coverage and use a model or policy that explicitly supports partial history. Once mature, Managed Service for Apache Flink checkpoints and application snapshots handle normal recovery without replaying 30 days of events.
 
-**SageMaker cold starts.** New instances take ~1–2 minutes to come online. At 30k RPS, sudden traffic spikes could exhaust the current instance pool before scale-out completes. Mitigate with a higher `min_capacity` baseline in production and a short scale-out cooldown (60s).
+**SageMaker scale-out is not instantaneous.** At 30k RPS, sudden traffic spikes could exhaust the current instance pool before new capacity becomes available. Measure scale-out time during load testing, then configure a sufficient production `min_capacity`, burst headroom, and scale-out policy so the existing fleet can carry traffic during that interval.
 
 **Location encoding.** The model was trained with a `LabelEncoder` mapping location strings to integers. This artifact must be stored alongside `fraud_model.pkl` in S3 and loaded by the FastAPI container at startup (TODO — not yet implemented). Non-numeric location strings cannot be encoded until the lookup table is available.
 
 ---
 
 ## 8. CI/CD
+
+> **Implementation scope:** The infrastructure and deployment topology in this section is a production design proposal. Only the components present under `infra/` and `.github/workflows/` are implemented in this repository. Components shown for ECR, artifact storage, monitoring, and the complete cross-account release flow are target-state design unless corresponding code is present.
 
 ### 8.0 AWS Account Structure
 
@@ -362,6 +414,8 @@ Cross-account S3 read: tooling bucket policy grants `s3:GetObject` on the `model
 
 ### 8.3 Flink job
 
+> `fraud_feat_enrich/job.py` is non-deployable PyFlink design pseudocode. The Maven/JAR workflow below describes the target production deployment shape, not a build that can currently be executed from this repository. A production implementation must explicitly choose Java/Scala with Maven, or replace this workflow with a supported PyFlink packaging and deployment process.
+
 ```
 CI — merge to main
   → OIDC → tooling account
@@ -371,11 +425,11 @@ CI — merge to main
 Deploy via deploy.yml (workflow_dispatch, component=fraud_feature_pipe):
   → OIDC → target account (dev|sit|prod)
   → terraform apply -var="flink_jar_s3_key=flink/fraud-pipeline-{git_sha}.jar"
-  → KDA role in target account reads JAR cross-account from tooling S3
-  → KDA application updated, Flink job restarts
+  → Managed Service for Apache Flink role in target account reads JAR cross-account from tooling S3
+  → Managed Service for Apache Flink application updated, Flink job restarts
 ```
 
-Cross-account S3 read: tooling bucket policy grants `s3:GetObject` to each account's KDA execution role; the KDA role policy grants `s3:GetObject` on the tooling bucket ARN.
+Cross-account S3 read: tooling bucket policy grants `s3:GetObject` to each account's Managed Service for Apache Flink execution role; the execution-role policy grants `s3:GetObject` on the tooling bucket ARN.
 
 ### 8.4 Rollback
 
@@ -408,6 +462,8 @@ No image promotion step — all environments reference the same tooling ECR imag
 
 ## 9. Monitoring
 
+> **Design proposal:** This section describes the target monitoring architecture. The repository does not currently contain the referenced `infra/components/monitoring/` Terraform component or the custom PSI, SHAP, and prediction-rate Lambda implementations. These resources are proposed rather than deployed by the supplied IaC.
+
 ### 9.1 Alert routing — three channels
 
 Business fraud alerts, ML drift alerts, and infrastructure alerts go to separate Slack channels so the right team gets paged for the right reason.
@@ -417,18 +473,18 @@ Real-time fraud score ──→ Lambda ─────────────�
 
                           Deequ (Data Quality)                    ┐
                           Clarify Bias P(Ŷ|group)                 │ publishes directly → CloudWatch Alarm ┐
-                          Model Quality P(Y|X)                    ┘                                       ├→ SNS → Chatbot → #ml-monitoring  (ML team)
+                          Model Quality P(Y|X)                    ┘                                       ├→ SNS → Amazon Q Developer → #ml-monitoring  (ML team)
 Data & model drift    ──→                                                                                 │
                           SHAP drift Lambda (reads Clarify S3 → put_metric_data) → CloudWatch ───────────┤
                           PSI Lambda (Athena → put_metric_data)                  → CloudWatch ───────────┤
                           P(Ŷ) rate Lambda (put_metric_data)                     → CloudWatch ───────────┘
 
-Infra / latency       ──→ CloudWatch Alarm → SNS → Chatbot ─────────────────────────→ #fraud-infra-ops  (platform team)
+Infra / latency       ──→ CloudWatch Alarm → SNS → Amazon Q Developer ───────────────→ #fraud-infra-ops  (platform team)
 ```
 
-Lambda handles the business path (threshold logic, message formatting). CloudWatch + AWS Chatbot handle the monitoring and infra paths with zero custom code.
+Lambda handles the business path (threshold logic, message formatting). CloudWatch and Amazon Q Developer in chat applications handle the monitoring and infrastructure notification paths with zero custom code.
 
-**AWS Chatbot one-time setup:** Slack workspace authorization requires a manual OAuth flow in the AWS Console once per account. After that, `aws_chatbot_slack_channel_configuration` is fully Terraform-managed.
+**Amazon Q Developer one-time setup:** Slack workspace authorization requires a manual OAuth flow in the AWS Console once per account. After that, the configuration is Terraform-managed; the Terraform resource retains its legacy name, `aws_chatbot_slack_channel_configuration`.
 
 ---
 
@@ -456,12 +512,26 @@ Further reading: [DBShap (arXiv 2401.09756)](https://arxiv.org/abs/2401.09756) �
 
 ### 9.2.1 Drift response strategy
 
-Without ground truth, drift type cannot be distinguished from proxy signals alone. When two or more signals (P(Ŷ) shift, SHAP rank order change, PSI) fire together and persist beyond 1-3 weeks, retrain.
+Drift is an investigation trigger, not an automatic retraining or deployment trigger. The investigation first determines whether the signal is caused by a data-pipeline defect, a legitimate business or population change, adversarial behaviour, label delay, or genuine model-performance degradation. Pipeline defects are fixed and data is backfilled; they are not solved by retraining the model.
 
-```
-Retrain on recent data → upload new model.tar.gz to tooling S3
-    ↓
-deploy.yml: component=inference, env=prod, model_version=vN+1
+There are two separate decisions:
+
+1. **Train a candidate.** Start retraining when the investigation rules out a pipeline defect and either validated model quality breaches an agreed SLO, or persistent material proxy drift indicates that the production population is no longer represented by the training data. Sufficient recent, representative data must exist to train and evaluate a meaningful candidate.
+2. **Promote the candidate.** Retraining does not authorize deployment. Promotion requires the candidate to beat the incumbent on pre-agreed offline metrics and protected segments, pass calibration and safety checks, perform acceptably in shadow mode, receive approval, and then pass a canary deployment with automatic rollback criteria.
+
+| Evidence after investigation | Decision |
+|---|---|
+| Schema, missingness, join, timestamp, or encoding defect | Fix the pipeline and backfill/replay affected data; do not retrain on corrupted data |
+| Ground-truth performance breaches an agreed SLO with sufficient sample size, such as recall below the fraud-loss target or calibration outside tolerance | Train and evaluate a candidate |
+| Business/population change is confirmed and recent labelled data is representative | Train and evaluate a candidate |
+| Persistent PSI, SHAP, and prediction-rate drift but labels are unavailable | Train a candidate for offline/shadow evaluation if enough representative data exists; do not automatically promote it |
+| Isolated or transient proxy drift with stable data quality and business KPIs | Continue monitoring and investigate; no retraining yet |
+| Scheduled refresh is required for governance, but no degradation is observed | Retrain a candidate on schedule, but promote only if it passes the same evaluation gates |
+
+```text
+detect → investigate → decide whether to train a candidate
+       → validate labels, performance, calibration, and segments
+       → shadow evaluation → approval → canary → promote or rollback
 ```
 
 **When ground truth is unavailable:**
@@ -474,7 +544,7 @@ Chargebacks may not exist or arrive too late to be actionable. In this case AUC 
 | SHAP rank order change | Top-3 features by E[\|φᵢ\|] change, sustained > 2 weeks | Model's decision basis has shifted away from training behaviour |
 | PSI high + SHAP drift together | PSI > 0.2 on multiple features AND SHAP rank changes | Input distribution and model response both shifted — stronger retraining signal than either alone |
 
-No single proxy is conclusive. When two or more fire together, the conservative response is to retrain. If ground truth is structurally unavailable (no chargeback pipeline), consider a calendar-based retraining cadence (e.g. quarterly) as a baseline policy — explicit and auditable even if not data-driven.
+No single proxy is conclusive. Multiple persistent proxy signals can justify producing a candidate, but cannot establish that the candidate is better than the incumbent. If ground truth is structurally unavailable, use shadow evaluation, stability and calibration proxies, manual review, and a calendar-based candidate-training cadence; retain explicit approval and rollback gates for production promotion.
 
 ---
 
@@ -484,7 +554,7 @@ No single proxy is conclusive. When two or more fire together, the conservative 
 
 Both Data Quality and Model Quality monitors use the [AWS pre-built Model Monitor container](https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor-pre-built-container.html). The `image_uri` in `data_quality_app_specification` points to AWS's own ECR image (`sagemaker-model-monitor-analyzer`). The optional `record_preprocessor_source_uri` / `post_analytics_processor_source_uri` fields are only needed for custom preprocessing and are left unset.
 
-**Managed by Terraform** (`infra/components/monitoring/`):
+**Proposed Terraform resources** (the referenced `infra/components/monitoring/` is not implemented in this repository):
 - `aws_sagemaker_data_quality_job_definition` — defines what to compare and where to write reports
 - `aws_sagemaker_monitoring_schedule` — runs hourly against the live endpoint's captured traffic
 - `aws_cloudwatch_metric_alarm` — fires when `feature_baseline_drift_violations > 0`
@@ -519,7 +589,7 @@ Updating the baseline after a retrain = update the S3 path variables + `task app
 
 > **Note:** This section assumes a chargeback / confirmed-label pipeline exists. In practice ground truth is often unavailable or arrives too late to be actionable — in that case fall back to the proxy-signal approach in §9.2.1.
 
-**Managed by Terraform:**
+**Proposed Terraform resources** (not implemented in this repository):
 - `aws_sagemaker_model_quality_job_definition` — BinaryClassification, compares `fraud_probability` predictions to ground truth
 - `aws_sagemaker_monitoring_schedule` — runs daily (ground truth arrives with ~24 h lag)
 - `aws_cloudwatch_metric_alarm` — fires when `metric_violations > 0`
@@ -553,7 +623,7 @@ Reports AUC, precision, recall vs baseline constraints
 
 ### 9.5 Infrastructure monitoring
 
-CloudWatch alarms on SageMaker native metrics, routed to `#fraud-infra-ops` via AWS Chatbot:
+CloudWatch alarms on SageMaker native metrics, routed to `#fraud-infra-ops` via Amazon Q Developer in chat applications:
 
 | Alarm | Metric | Threshold |
 |---|---|---|
@@ -565,13 +635,13 @@ The volume drop alarm is the upstream health signal: if Flink or Kinesis fails, 
 
 ---
 
-### 9.6 What Terraform manages vs what it doesn't
+### 9.6 Target-state Terraform responsibility
 
-| Concern | Terraform | External |
+| Concern | Proposed Terraform scope | External dependency |
 |---|---|---|
 | Data Quality Monitor schedule + job | ✅ | |
 | Model Quality Monitor schedule + job | ✅ | |
 | CloudWatch alarms + SNS topics | ✅ | |
-| AWS Chatbot → Slack channel config | ✅ | One-time Slack OAuth (manual) |
+| Amazon Q Developer → Slack channel config | ✅ | One-time Slack OAuth (manual); Terraform resource name retains `aws_chatbot_*` |
 | Baseline statistics / constraints | ✅ references S3 path | ML pipeline generates the files |
 | Ground truth label ingestion | | Fraud ops pipeline |

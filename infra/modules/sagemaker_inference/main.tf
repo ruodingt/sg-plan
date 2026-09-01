@@ -223,7 +223,8 @@ resource "aws_appautoscaling_policy" "invocations" {
     predefined_metric_specification {
       predefined_metric_type = "SageMakerVariantInvocationsPerInstance"
     }
-    # ml.c6i.xlarge 跑 XGBoost 9 features，保守估算 3k invocations/min/instance
+    # Provisional development placeholder only. Replace with the benchmark-derived
+    # value described in README section 6.1 before production deployment.
     target_value       = 3000
     scale_in_cooldown  = 300
     scale_out_cooldown = 60
