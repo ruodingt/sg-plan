@@ -137,21 +137,24 @@ Key points:
 
 ## 5. Key Design Decisions
 
-### 5.1 Stream processing — Amazon Managed Service for Apache Flink vs PySpark Structured Streaming
+### 5.1 Stream processing — Amazon Managed Service for Apache Flink vs AWS Glue PySpark Streaming
 
-**Decision: Amazon Managed Service for Apache Flink.** Rolling 30-day aggregates are inherently stateful; Flink's keyed streams guarantee that all events for a given `customer_id` are processed sequentially by the same task.
+This comparison is specific to the required workload: Kinesis input, PySpark, stateful rolling aggregates, and continuously updated demographic CDC data. It is not a general claim that Spark Structured Streaming cannot implement stateful streaming.
 
-**Rejected: PySpark Structured Streaming (Glue Streaming / EMR).**
-
-| | Amazon Managed Service for Apache Flink | PySpark Structured Streaming |
+| Concern | Amazon Managed Service for Apache Flink | AWS Glue PySpark Streaming |
 |---|---|---|
-| Processing model | True event-by-event streaming | Micro-batch (1–10 s intervals) |
-| End-to-end latency | Milliseconds | Seconds |
-| Live broadcast join | `KeyedBroadcastProcessFunction` — CDC stream updates broadcast state in real time | Broadcast only supports static DataFrames; CDC requires periodic full reload (minutes of lag) |
-| Stateful windowing | Native RocksDB-backed state | Possible via `flatMapGroupsWithState` but operationally heavier |
-| AWS managed | Amazon Managed Service for Apache Flink | Glue Streaming / EMR |
+| Processing model | Record-at-a-time processing through keyed operators and process functions | Micro-batch for the required PySpark + Kinesis + stateful workload |
+| Latency profile | Sub-second stream processing is achievable; the end-to-end SLO must be validated | Typically at least 1–2 seconds for Glue micro-batch, depending on trigger interval and batch processing time |
+| Demographic CDC join | Native `KeyedBroadcastProcessFunction` with broadcast state updated by CDC events | No direct mutable-broadcast-state equivalent; alternatives include a stream-stream/stateful join, external lookup, or periodic snapshot refresh |
+| Rolling aggregates | Fine-grained keyed state, event-time timers, and per-event updates | Supported through Structured Streaming stateful aggregations, watermarks, and checkpointed state, evaluated per micro-batch |
+| Failure recovery | Managed checkpoints and application snapshots | Structured Streaming checkpoints |
+| Fit for this workload | Direct fit for low-latency per-event enrichment with continuously updated state | Viable when micro-batch latency and the additional join/state design are acceptable |
 
-Fraud detection requires a score before the customer session ends — second-level latency is too high. The live demographic broadcast (DMS CDC) is also a blocker: PySpark cannot update a broadcast variable from a streaming source; demographic changes would lag by the reload interval. A batch engine such as Glue could be introduced later if the business requires a historical activity bootstrap, but it is not part of the selected progressive warm-up design.
+**Decision: Amazon Managed Service for Apache Flink.** Its record-at-a-time processing, keyed state, event-time timers, and native broadcast-state pattern map directly to this workload. AWS Glue PySpark can implement the required joins and windows, but for a Kinesis-sourced, PySpark, stateful workload it operates in micro-batches and has no direct equivalent to Flink's continuously updated broadcast state. The decision is therefore based on latency and implementation fit, not on Spark being incapable of stateful streaming.
+
+**Latency assumption:** the stream-processing portion of the fraud-alerting pipeline targets sub-second latency, excluding downstream Slack delivery. This is a design assumption that must be confirmed with the business and validated under representative load; the assessment does not provide a numeric latency SLO.
+
+A batch engine such as Glue could still be introduced later if the business requires a historical activity bootstrap, but it is not part of the selected progressive warm-up design.
 
 ---
 
